@@ -19,6 +19,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from email_functions import parse_email_details, get_sender_from_message
+from GCS import upload_attachment_to_gcs
 
 # --- Configuration ---
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
@@ -65,14 +66,14 @@ def load_token():
 
 def get_allowed_senders_from_mongo():
     """
-    Fetches a dictionary of {email: created_at_timestamp} for candidates
-    in an active follow-up state, using the global client.
+    Fetches a list of candidate documents from MongoDB that are in an
+    active follow-up state, using the global client.
     """
     if not mongo_client:
         print("Skipping sender fetch: no active MongoDB connection.")
-        return {}
+        return [] # Return an empty list, which is iterable
 
-    print("Fetching allowed senders and creation times from MongoDB...")
+    print("Fetching active candidate records from MongoDB...")
     
     try:
         db = mongo_client.nextleap
@@ -91,24 +92,16 @@ def get_allowed_senders_from_mongo():
             ]
         }
         
-       
-        projection = {'_id': 0, 'Email': 1, 'created_at': 1}
-        
-        cursor = collection.find(query_filter, projection)
+        # We need the full document to get _id, Email, created_at, etc.
+        # The .find() method returns a cursor, which we convert to a list of dictionaries.
+        active_candidates = list(collection.find(query_filter))
 
-        senders_with_timestamps = {
-            doc['Email'].lower(): doc['created_at'] 
-            for doc in cursor if 'Email' in doc and 'created_at' in doc and doc['Email'] and doc['created_at']
-        }
-
-        print(f"Successfully fetched {len(senders_with_timestamps)} active candidates from MongoDB.")
-        return senders_with_timestamps
-    
+        print(f"Successfully fetched {len(active_candidates)} active candidate records.")
+        return active_candidates
     except Exception as e:
-
         print(f"!!! CRITICAL: Could not fetch allowed senders from MongoDB: {e}")
         traceback.print_exc()
-        return {}
+        return [] # Return an empty list on error
 
 def process_candidate_followups():
     """
@@ -280,7 +273,18 @@ async def poll_inbox():
                 print(f"Checking for replies from {len(senders_to_check)} active candidates...")
                 
                 # Loop through each candidate and build a specific query for them.
-                for email, created_at in senders_to_check.items():
+                for candidate in senders_to_check:
+                    
+                    candidate_id = candidate["_id"]
+                    email = candidate.get("Email")
+                    created_at = candidate.get("created_at")
+
+                    first_name = candidate.get("First Name", "")
+                    last_name = candidate.get("Last Name", "")
+                    candidate_name = f"{first_name} {last_name}".strip() or "Unknown_Candidate"
+
+                    if not all([email, created_at,candidate_id]):
+                        continue
                     # Convert the created_at datetime to a Unix timestamp for the Gmail API query.
                     after_timestamp = int(created_at.timestamp())
                     
@@ -315,6 +319,43 @@ async def poll_inbox():
                         print(email_data['body'] or "[No Body Content Found]")
                         print("------------------ EMAIL END ------------------")
                         print()
+                        
+                        if email_data['attachments']:
+                            print("---")
+                            print(f"Found {len(email_data['attachments'])} attachment(s):")
+                            for attachment_info in email_data['attachments']:
+                                # 1. Download attachment data from Gmail
+                                attachment_response = service.users().messages().attachments().get(
+                                    userId='me', messageId=msg_id, id=attachment_info['attachment_id']
+                                ).execute()
+                                file_data_b64 = attachment_response.get('data')
+
+                                if file_data_b64:
+                                    file_data = base64.urlsafe_b64decode(file_data_b64.encode('UTF-8'))
+                                    
+                                    # 2. Upload to GCS and get the public URL
+                                    gcs_url = upload_attachment_to_gcs(
+                                        file_data,
+                                        attachment_info['filename'],
+                                        candidate_id,
+                                        candidate_name 
+                                    )
+
+                                    # 3. If upload was successful, link the URL in MongoDB
+                                    if gcs_url and mongo_client:
+                                        attachment_record = {
+                                            "gcs_url": gcs_url,
+                                            "filename": attachment_info['filename'],
+                                            "size_bytes": attachment_info['size'],
+                                            # "received_at": datetime.now(timezone.utc)
+                                        }
+                                        db = mongo_client.nextleap
+                                        collection = db.candidates
+                                        collection.update_one(
+                                            {"_id": candidate_id},
+                                            {"$push": {"attachments": attachment_record}}
+                                        )
+                                        print(f"  -> Successfully linked GCS attachment to candidate {candidate_id}")
 
                         # Update the candidate's status in the database to stop follow-ups.
                         if mongo_client:
