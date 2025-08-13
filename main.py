@@ -362,11 +362,11 @@ async def poll_inbox():
                         email_data = parse_email_details(msg_detail)
                         
                         # Log the content
-                        print("----------------- CONTENT START -----------------")
+                        print("----------------- EMAIL START -----------------")
                         print(f"Subject: {email_data['subject'] or '[No Subject Found]'}")
                         print("---")
                         print(email_data['body'] or "[No Body Content Found]")
-                        print("------------------ CONTENT END ------------------")
+                        print("------------------ EMAIL END ------------------")
                         print()
 
                         # Update the candidate's status in the database to stop follow-ups.
