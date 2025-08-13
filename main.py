@@ -434,7 +434,7 @@ async def authorize():
     flow = Flow.from_client_secrets_file(
         CREDENTIALS_FILE,
         scopes=SCOPES,
-        redirect_uri='http://localhost:8000/callback'
+        redirect_uri='http://localhost:8080/callback'
     )
     
     oauth_state = secrets.token_urlsafe(16)
