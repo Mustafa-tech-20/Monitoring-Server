@@ -1,0 +1,33 @@
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# === Virtual Environment ===
+venv/
+env/
+.venv/
+ENV/
+
+# === OS Files ===
+.DS_Store
+Thumbs.db
+
+# === Environment Variables ===
+.env
+
+# === Credentials ===
+credentials.json
+token.json
+
+# === IDE / Editor Files ===
+.vscode/
+.idea/
+
+# === Backup & Temporary ===
+*.tmp
+*.bak
+*.swp
+*.swo
