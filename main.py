@@ -9,6 +9,7 @@ import base64
 from contextlib import asynccontextmanager
 from email.utils import parseaddr
 from pymongo import MongoClient 
+from bson import ObjectId
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -213,7 +214,7 @@ We are waiting for you to reply to the previous onboarding email with the requir
 If you have any questions or have already sent the documents, please let us know by replying to this email.
 
 Best regards,
-The Onboarding Team
+NextLeap Onboarding Team
                 """
 
         # 2. Create the email message object
@@ -274,7 +275,7 @@ async def poll_inbox():
                 
                 # Loop through each candidate and build a specific query for them.
                 for candidate in senders_to_check:
-                    
+
                     candidate_id = candidate["_id"]
                     email = candidate.get("Email")
                     created_at = candidate.get("created_at")
@@ -351,9 +352,14 @@ async def poll_inbox():
                                         }
                                         db = mongo_client.nextleap
                                         collection = db.candidates
+                                        #change status to Documents_Received
+                                        # and push the attachment record to the candidate's attachments array.
                                         collection.update_one(
-                                            {"_id": candidate_id},
-                                            {"$push": {"attachments": attachment_record}}
+                                            {"_id": ObjectId(candidate_id)},
+                                            {
+                                                "$set": {"status": "Documents_Received"},
+                                                "$push": {"attachments": attachment_record}
+                                            }
                                         )
                                         print(f"  -> Successfully linked GCS attachment to candidate {candidate_id}")
 
@@ -361,11 +367,20 @@ async def poll_inbox():
                         if mongo_client:
                             db = mongo_client.nextleap
                             collection = db.candidates
-                            collection.update_one(
-                                {"Email": {"$regex": f"^{email}$", "$options": "i"}},
-                                {"$set": {"status": "Reply_received_from_candidate"}}
+
+                            # dont change the status if it is Documents_Received
+                            result = collection.update_one(
+                                {
+                                    "Email": {"$regex": f"^{email}$", "$options": "i"},
+                                    "status": {"$ne": "Documents_Received"}  # only update if status is NOT Documents_Received
+                                },
+                                {
+                                    "$set": {"status": "Reply_received_from_candidate"}
+                                }
                             )
-                            print(f"  -> Status for {email} updated to 'Reply_received_from_candidate'.")
+
+                            if result.modified_count > 0:
+                                print(f"  -> Status for {email} updated to 'Reply_received_from_candidate'.")
 
                         # Add the message ID to our processed set.
                         processed_message_ids.add(msg_id)
