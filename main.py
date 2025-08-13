@@ -41,6 +41,17 @@ gmail_poller_task: asyncio.Task | None = None
 oauth_state: str | None = None
 mongo_client: MongoClient | None = None
 
+ALLOWED_MIME_TYPES = {
+    # Documents
+    'application/pdf',  # .pdf
+    'application/msword',  # .doc
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx
+
+    # Images
+    'image/jpeg', # .jpg, .jpeg
+    'image/png',   # .png
+}
+
 
 def save_token(current_creds: Credentials):
     """Saves credentials to the token file."""
@@ -324,7 +335,15 @@ async def poll_inbox():
                         if email_data['attachments']:
                             print("---")
                             print(f"Found {len(email_data['attachments'])} attachment(s):")
+
                             for attachment_info in email_data['attachments']:
+
+                                if attachment_info['mime_type'] not in ALLOWED_MIME_TYPES:
+                                    print(f"  -> SKIPPING attachment '{attachment_info['filename']}'. "
+                                          f"MIME type '{attachment_info['mime_type']}' is not allowed.")
+                                    
+                                    continue 
+
                                 # 1. Download attachment data from Gmail
                                 attachment_response = service.users().messages().attachments().get(
                                     userId='me', messageId=msg_id, id=attachment_info['attachment_id']
@@ -348,7 +367,7 @@ async def poll_inbox():
                                             "gcs_url": gcs_url,
                                             "filename": attachment_info['filename'],
                                             "size_bytes": attachment_info['size'],
-                                            # "received_at": datetime.now(timezone.utc)
+                                            "received_at": datetime.now(timezone.utc)
                                         }
                                         db = mongo_client.nextleap
                                         collection = db.candidates
