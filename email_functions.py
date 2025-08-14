@@ -3,6 +3,16 @@ import base64
 from email.utils import parseaddr
 
 
+ALLOWED_MIME_TYPES = {
+    # Documents
+    'application/pdf',  # .pdf
+    'application/msword',  # .doc
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx
+
+    # Images
+    'image/jpeg', # .jpg, .jpeg
+    'image/png',   # .png
+}
 
 def get_sender_from_message(msg_detail):
     """Parses the 'From' header to get the sender's email address."""

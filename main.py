@@ -6,6 +6,7 @@ import asyncio
 import secrets
 import traceback
 import base64
+import certifi
 
 from contextlib import asynccontextmanager
 from email.utils import parseaddr
@@ -21,13 +22,10 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from google.auth.transport.requests import Request as GoogleAuthRequest
-from email_functions import parse_email_details, get_sender_from_message
+from email_functions import parse_email_details, get_sender_from_message , ALLOWED_MIME_TYPES
 from GCS import upload_attachment_to_gcs
+from config import SCOPES, TOKEN_FILE, CREDENTIALS_FILE
 
-# --- Configuration ---
-SCOPES = ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/drive']
-TOKEN_FILE = 'token.json'
-CREDENTIALS_FILE = 'credentials.json'
 
 # IMPORTANT: This line MUST be before any google_auth_oauthlib imports.
 # In production, you must use HTTPS.
@@ -43,26 +41,14 @@ gmail_poller_task: asyncio.Task | None = None
 oauth_state: str | None = None
 mongo_client: MongoClient | None = None
 
-ALLOWED_MIME_TYPES = {
-    # Documents
-    'application/pdf',  # .pdf
-    'application/msword',  # .doc
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx
-
-    # Images
-    'image/jpeg', # .jpg, .jpeg
-    'image/png',   # .png
-}
-
 
 def save_token(current_creds: Credentials):
-    """Saves credentials to the token file."""
     with open(TOKEN_FILE, 'w') as token:
         token.write(current_creds.to_json())
     print("Token saved successfully.")
 
 def load_token():
-    """Loads credentials from the token file and refreshes them if expired."""
+
     global creds
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
@@ -79,10 +65,7 @@ def load_token():
 
 
 def get_allowed_senders_from_mongo():
-    """
-    Fetches a list of candidate documents from MongoDB that are in an
-    active follow-up state, using the global client.
-    """
+
     if not mongo_client:
         print("Skipping sender fetch: no active MongoDB connection.")
         return [] # Return an empty list, which is iterable
@@ -90,8 +73,7 @@ def get_allowed_senders_from_mongo():
     print("Fetching active candidate records from MongoDB...")
     
     try:
-        db = mongo_client.nextleap
-        collection = db.candidates
+        db, collection = get_db_collection()
         
         active_reply_statuses = [
             "Onboarding_Email_Sent",
@@ -118,10 +100,7 @@ def get_allowed_senders_from_mongo():
         return [] # Return an empty list on error
 
 def process_candidate_followups():
-    """
-    Checks for candidates needing status updates, sends follow-up emails,
-    and updates their status in MongoDB.
-    """
+
     if not mongo_client:
         print("Skipping follow-up processing: no active MongoDB connection.")
         return
@@ -136,9 +115,7 @@ def process_candidate_followups():
     active_statuses = [stage[0] for stage in followup_stages]
 
     try:
-        db = mongo_client.nextleap
-        collection = db.candidates
-        
+        db, collection = get_db_collection()
         candidates_to_check = list(collection.find({"status": {"$in": active_statuses}}))
         
         if not candidates_to_check:
@@ -201,9 +178,6 @@ def process_candidate_followups():
         traceback.print_exc()
 
 def send_follow_up_email(candidate_email, candidate_name, follow_up_number):
-    """
-    Constructs and sends a follow-up email to a candidate using the Gmail API.
-    """
 
     service = get_gmail_service()
 
@@ -263,10 +237,7 @@ def get_gmail_service():
     return build('gmail', 'v1', credentials=creds)
 
 def _find_or_create_folder(drive_service, folder_name, parent_id='root'):
-    """
-    Finds a folder by name within a parent folder (defaults to 'root'),
-    or creates it if not found. Returns the folder's ID.
-    """
+
     # The query now correctly uses the parent_id, which defaults to 'root'.
     query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false and '{parent_id}' in parents"
     
@@ -288,47 +259,41 @@ def _find_or_create_folder(drive_service, folder_name, parent_id='root'):
         print(f"  -> Created Drive folder '{folder_name}' with ID: {folder.get('id')}")
         return folder.get('id')
 
-def upload_attachment_to_drive(file_data, original_filename, candidate_name):
-    """
-    Uploads a file to Google Drive under root/candidate_attachments/candidate_name.
-    Prevents duplicate filenames for the same candidate.
-    Returns shareable webViewLink if uploaded.
-    """
-    service = get_gmail_service()
-    if not service:
-        print("  -> Cannot upload to Drive: Service not available.")
+def upload_attachment_to_drive(creds, file_data, original_filename, candidate_name):
+
+    # Check credentials
+    if not (creds and creds.valid):
+        print("  -> Cannot upload to Drive: Invalid credentials provided.")
         return None
 
     try:
-        drive_service = build('drive', 'v3', credentials=service.credentials)
-        
-        # Find or create the main folder
+        # Build Drive service
+        drive_service = build('drive', 'v3', credentials=creds)
+
+        # Find or create root folder for attachments
         parent_folder_id = _find_or_create_folder(drive_service, "candidate_attachments")
-        
+
         # Sanitize candidate folder name
         sanitized_name = "".join(c for c in candidate_name if c.isalnum() or c in (' ',)).replace(' ', '_')
         candidate_folder_id = _find_or_create_folder(drive_service, sanitized_name, parent_id=parent_folder_id)
-        
-        # Remove timestamp logic (to allow exact duplicate check)
+
+        # Use exact original filename (no timestamp) for duplicate checking
         name_part, extension = os.path.splitext(original_filename)
         final_filename = f"{name_part}{extension}"
 
-        # --- DUPLICATE CHECK in Drive ---
+        # --- DUPLICATE CHECK ---
         query = f"'{candidate_folder_id}' in parents and name = '{final_filename}' and trashed = false"
         results = drive_service.files().list(q=query, fields="files(id, webViewLink)").execute()
         files = results.get('files', [])
-        
+
         if files:
             print(f"  -> !!! File '{final_filename}' already exists for {candidate_name} in Drive. Skipping upload.")
-            return None  # Skip to prevent duplicate DB linking
-        
+            return None  # Prevents duplicate DB entries
+
         # Prepare metadata & upload
-        file_metadata = {
-            'name': final_filename,
-            'parents': [candidate_folder_id]
-        }
+        file_metadata = {'name': final_filename, 'parents': [candidate_folder_id]}
         media = MediaIoBaseUpload(io.BytesIO(file_data), mimetype='application/octet-stream', resumable=True)
-        
+
         print(f"  -> Uploading '{original_filename}' as '{final_filename}' to Google Drive...")
         file = drive_service.files().create(
             body=file_metadata,
@@ -413,7 +378,6 @@ async def poll_inbox():
                         print("---")
                         print(email_data['body'] or "[No Body Content Found]")
                         print("------------------ EMAIL END ------------------")
-                        print()
                         
                         if email_data['attachments']:
                             print("---")
@@ -447,6 +411,7 @@ async def poll_inbox():
                                     #upload to drive
 
                                     drive_url = upload_attachment_to_drive(
+                                        creds,
                                         file_data,
                                         attachment_info['filename'],
                                         candidate_name
@@ -461,8 +426,7 @@ async def poll_inbox():
                                             "size_bytes": attachment_info['size'],
                                             "received_at": datetime.now(timezone.utc)
                                         }
-                                        db = mongo_client.nextleap
-                                        collection = db.candidates
+                                        _, collection = get_db_collection()
                                         #change status to Documents_Received
                                         # and push the attachment record to the candidate's attachments array.
                                         collection.update_one(
@@ -476,8 +440,7 @@ async def poll_inbox():
 
                         # Update the candidate's status in the database to stop follow-ups.
                         if mongo_client:
-                            db = mongo_client.nextleap
-                            collection = db.candidates
+                            _, collection = get_db_collection()
 
                             # dont change the status if it is Documents_Received
                             result = collection.update_one(
@@ -530,21 +493,33 @@ async def stop_gmail_poller():
         gmail_poller_task = None
 
 # --- FastAPI Lifespan and App ---
+def get_db_collection():
+
+    if not mongo_client:
+        return None, None
+    
+    db_name = os.getenv("MONGO_DB_NAME")
+    collection_name = os.getenv("MONGO_COLLECTION_NAME")
+    
+    if not db_name or not collection_name:
+        print("!!! CRITICAL: MONGO_DB_NAME or MONGO_COLLECTION_NAME not set in .env file.")
+        return None, None
+        
+    db = mongo_client[db_name]
+    collection = db[collection_name]
+    return db, collection
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Handles startup and shutdown events, including the DB connection."""
+
     global mongo_client
-    
-    # --- On startup ---
     print("Application startup...")
-    
-    # Establish MongoDB connection
+
     mongo_uri = os.getenv("MONGO_URI")
     if mongo_uri:
         try:
             print("Connecting to MongoDB...")
-            mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+            mongo_client = MongoClient(mongo_uri,tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
             # The ismaster command is cheap and does not require auth.
             mongo_client.admin.command('ismaster')
             print("MongoDB connection successful.")
@@ -563,7 +538,6 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # --- On shutdown ---
     print("Application shutdown...")
     if mongo_client:
         print("Closing MongoDB connection.")
@@ -572,8 +546,6 @@ async def lifespan(app: FastAPI):
     await stop_gmail_poller()
 
 app = FastAPI(lifespan=lifespan)
-
-# --- FastAPI Endpoints ---
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
