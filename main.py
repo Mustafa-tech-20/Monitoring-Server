@@ -1,4 +1,5 @@
 import os
+import io
 import base64
 import traceback
 import asyncio
@@ -18,12 +19,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from email_functions import parse_email_details, get_sender_from_message
 from GCS import upload_attachment_to_gcs
 
 # --- Configuration ---
-SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/drive']
 TOKEN_FILE = 'token.json'
 CREDENTIALS_FILE = 'credentials.json'
 
@@ -260,6 +262,87 @@ def get_gmail_service():
         return None
     return build('gmail', 'v1', credentials=creds)
 
+def _find_or_create_folder(drive_service, folder_name, parent_id='root'):
+    """
+    Finds a folder by name within a parent folder (defaults to 'root'),
+    or creates it if not found. Returns the folder's ID.
+    """
+    # The query now correctly uses the parent_id, which defaults to 'root'.
+    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false and '{parent_id}' in parents"
+    
+    response = drive_service.files().list(q=query, spaces='drive', fields='files(id)').execute()
+    files = response.get('files', [])
+    
+    if files:
+        # Folder found, return its ID
+        return files[0].get('id')
+    else:
+        # Folder not found, create it
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [parent_id] # Explicitly set the parent
+        }
+            
+        folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+        print(f"  -> Created Drive folder '{folder_name}' with ID: {folder.get('id')}")
+        return folder.get('id')
+
+def upload_attachment_to_drive(file_data, original_filename, candidate_name):
+    """
+    Uploads a file to Google Drive under root/candidate_attachments/candidate_name.
+    Prevents duplicate filenames for the same candidate.
+    Returns shareable webViewLink if uploaded.
+    """
+    service = get_gmail_service()
+    if not service:
+        print("  -> Cannot upload to Drive: Service not available.")
+        return None
+
+    try:
+        drive_service = build('drive', 'v3', credentials=service.credentials)
+        
+        # Find or create the main folder
+        parent_folder_id = _find_or_create_folder(drive_service, "candidate_attachments")
+        
+        # Sanitize candidate folder name
+        sanitized_name = "".join(c for c in candidate_name if c.isalnum() or c in (' ',)).replace(' ', '_')
+        candidate_folder_id = _find_or_create_folder(drive_service, sanitized_name, parent_id=parent_folder_id)
+        
+        # Remove timestamp logic (to allow exact duplicate check)
+        name_part, extension = os.path.splitext(original_filename)
+        final_filename = f"{name_part}{extension}"
+
+        # --- DUPLICATE CHECK in Drive ---
+        query = f"'{candidate_folder_id}' in parents and name = '{final_filename}' and trashed = false"
+        results = drive_service.files().list(q=query, fields="files(id, webViewLink)").execute()
+        files = results.get('files', [])
+        
+        if files:
+            print(f"  -> !!! File '{final_filename}' already exists for {candidate_name} in Drive. Skipping upload.")
+            return None  # Skip to prevent duplicate DB linking
+        
+        # Prepare metadata & upload
+        file_metadata = {
+            'name': final_filename,
+            'parents': [candidate_folder_id]
+        }
+        media = MediaIoBaseUpload(io.BytesIO(file_data), mimetype='application/octet-stream', resumable=True)
+        
+        print(f"  -> Uploading '{original_filename}' as '{final_filename}' to Google Drive...")
+        file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink'
+        ).execute()
+
+        print(f"  -> Drive upload successful. Link: {file.get('webViewLink')}")
+        return file.get('webViewLink')
+
+    except Exception as e:
+        print(f"  -> !!! FAILED to upload {original_filename} to Drive: {e}")
+        traceback.print_exc()
+        return None
 
 async def poll_inbox():
     """Periodically checks for unread emails AND processes candidate follow-ups."""
@@ -361,10 +444,19 @@ async def poll_inbox():
                                         candidate_name 
                                     )
 
+                                    #upload to drive
+
+                                    drive_url = upload_attachment_to_drive(
+                                        file_data,
+                                        attachment_info['filename'],
+                                        candidate_name
+                                    )
+
                                     # 3. If upload was successful, link the URL in MongoDB
-                                    if gcs_url and mongo_client:
+                                    if (gcs_url or drive_url) and mongo_client:
                                         attachment_record = {
                                             "gcs_url": gcs_url,
+                                            "drive_url": drive_url,
                                             "filename": attachment_info['filename'],
                                             "size_bytes": attachment_info['size'],
                                             "received_at": datetime.now(timezone.utc)
@@ -380,7 +472,7 @@ async def poll_inbox():
                                                 "$push": {"attachments": attachment_record}
                                             }
                                         )
-                                        print(f"  -> Successfully linked GCS attachment to candidate {candidate_id}")
+                                        print(f"  -> Successfully linked GCS and drive attachment to candidate {candidate_id}")
 
                         # Update the candidate's status in the database to stop follow-ups.
                         if mongo_client:
